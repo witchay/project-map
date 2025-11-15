@@ -1,0 +1,595 @@
+# app.py — QR anti-bounce + Speed/Mode controls + Telemetry (no PID UI)
+from flask import Flask, Response, jsonify, render_template_string, request, send_file
+import numpy as np, cv2, os, requests, time, threading
+from datetime import datetime
+from pyzbar.pyzbar import decode
+
+# ================= App / Config =================
+app = Flask(__name__, static_folder="static")
+
+ESP32_CAM_STREAM_URL = os.getenv("ESP32_CAM_STREAM_URL", "http://10.36.211.84/stream")
+ESP32_MOTOR_IP       = os.getenv("ESP32_MOTOR_IP",       "http://10.36.211.124")
+
+# QR distance model
+QR_REAL_HEIGHT_CM = float(os.getenv("QR_REAL_HEIGHT_CM", 16.0))
+FOCAL_PX          = int(os.getenv("FOCAL_PX", 192))      # ปรับให้ตรงกล้องจริง
+MIN_QR_H_PX       = int(os.getenv("MIN_QR_H_PX", 20))
+EMA_ALPHA         = float(os.getenv("EMA_ALPHA", 0.6))   # 0..1
+ANTI_SPIKE_CM     = float(os.getenv("ANTI_SPIKE_CM", 10))
+
+# ===== Anti-bounce / Debounce =====
+QR_MISS_TO_REARM        = int(os.getenv("QR_MISS_TO_REARM", 6))          # ต้อง "ไม่เจอ QR" ต่อเนื่อง N เฟรม ถึงจะ re-arm
+QR_RETRIGGER_COOLDOWN_S = float(os.getenv("QR_RETRIGGER_COOLDOWN_S", 6)) # คูลดาวน์ราย QR-ID
+POST_PAUSE_BLIND_MS     = int(os.getenv("POST_PAUSE_BLIND_MS", 3000))    # ช่วงบอดหลังปล่อยรถ
+
+# เกณฑ์ใกล้/ไกลจากขนาดกรอบและตำแหน่งในภาพ
+NEAR_AREA_RATIO      = float(os.getenv("NEAR_AREA_RATIO", 0.06))
+REARM_AREA_RATIO     = float(os.getenv("REARM_AREA_RATIO", 0.55))
+CENTER_Y_NEAR_RATIO  = float(os.getenv("CENTER_Y_NEAR_RATIO", 0.60))
+CENTER_Y_REARM_RATIO = float(os.getenv("CENTER_Y_REARM_RATIO", 0.45))
+
+# ================= State =================
+latest_info = {"text":"No QR Code Detected","qr_text":None,"x":None,"y":None,"distance":None,"height_px":None}
+previous_distance = None
+last_qr_text, last_qr_ts = None, 0.0
+latest_image_path = "latest.jpg"
+boot_ts = time.time()
+
+miss_streak = 999
+armed = True
+blind_until_ms = 0
+seen_close = {}
+
+# ===== Telemetry (IR, ms, PvLPWM, PvRPWM, error, output, baseDyn) =====
+telemetry_latest = {"ms":None,"ir":[None,None,None,None,None],"PvLPWM":None,"PvRPWM":None,"error":None,"output":None,"baseDyn":None}
+telemetry_ring = []
+TELEM_MAX = 200
+
+# ================= Campus mapping =================
+mapping = {
+    "qr1": {"name": "หอศิลปะและวัฒนธรรม", "x": 1073, "y": 375},
+    "qr2": {"name": "อาคารเฉลิมพระเกียรติ 60 ปี", "x": 1505, "y": 372},
+    "qr3": {"name": "อาคารนววิทย์บูรพาวณิชย์", "x": 1307, "y": 518},
+    "qr4": {"name": "คณะเภสัชศาสตร์", "x": 727, "y": 519},
+    "qr5": {"name": "ประตูสดใส", "x": 723, "y": 1126},
+    "qr6": {"name": "หอพักเทาทอง", "x": 1308, "y": 1129},
+}
+
+# ================= Utils =================
+def log_to_csv(typ, msg):
+    fp = "rtt_log_combined.csv"
+    new = not os.path.isfile(fp)
+    with open(fp, "a", encoding="utf-8") as f:
+        if new:
+            f.write("Timestamp,Type,Message\n")
+        ts = "'" + datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+        f.write(f"{ts},{typ},{msg}\n")
+
+def _motor_cmd(path, timeout=2):
+    try:
+        r = requests.get(f"{ESP32_MOTOR_IP}{path}", timeout=timeout)
+        return (r.text, 200)
+    except Exception as e:
+        print(f"_motor_cmd({path}) error:", e)
+        return ("Motor error", 500)
+
+def _motor_get(path, timeout=3):
+    try:
+        r = requests.get(f"{ESP32_MOTOR_IP}{path}", timeout=timeout)
+        r.raise_for_status()
+        return r.text
+    except Exception as e:
+        print(f"_motor_get({path}) error:", e)
+        return None
+
+def _calc_distance(h_px, prev):
+    if not h_px or h_px < MIN_QR_H_PX: return prev
+    d = (FOCAL_PX * QR_REAL_HEIGHT_CM) / float(h_px)
+    if prev is None: return round(d,1)
+    if abs(d - prev) > ANTI_SPIKE_CM: d = prev
+    d = EMA_ALPHA * d + (1.0 - EMA_ALPHA) * prev
+    return round(d,1)
+
+# ================= CORS =================
+@app.after_request
+def add_cors(resp):
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    resp.headers["Access-Control-Allow-Methods"] = "GET,POST,OPTIONS"
+    resp.headers["Access-Control-Allow-Headers"] = "Content-Type,Authorization"
+    return resp
+
+@app.route("/<path:_>", methods=["OPTIONS"])
+def any_options(_):
+    return ("", 200)
+
+# ================= Camera Worker =================
+class CamWorker:
+    def __init__(self, url):
+        self.url = url
+        self.cap = None
+        self.lock = threading.Lock()
+        self.frame = None
+        self.running = False
+        self.th = None
+
+    def start(self):
+        if self.running: return
+        self.running = True
+        self.th = threading.Thread(target=self._loop, daemon=True)
+        self.th.start()
+
+    def stop(self):
+        self.running = False
+        if self.th: self.th.join(timeout=1.0)
+        if self.cap:
+            try: self.cap.release()
+            except: pass
+        self.cap = None
+
+    def _open(self):
+        try:
+            self.cap = cv2.VideoCapture(self.url)
+            return self.cap.isOpened()
+        except Exception as e:
+            print("[CamWorker] open error:", e)
+            return False
+
+    def _loop(self):
+        backoff = 0.5
+        while self.running:
+            if not self.cap or not self.cap.isOpened():
+                if not self._open():
+                    time.sleep(backoff)
+                    backoff = min(5.0, backoff * 2)
+                    continue
+                backoff = 0.5
+            ok, f = self.cap.read()
+            if not ok or f is None:
+                try: self.cap.release()
+                except: pass
+                self.cap = None
+                time.sleep(0.2)
+                continue
+            with self.lock:
+                self.frame = f
+
+    def get_latest(self):
+        with self.lock:
+            return None if self.frame is None else self.frame.copy()
+
+cam = CamWorker(ESP32_CAM_STREAM_URL)
+cam.start()
+
+# ================= QR Decode =================
+def process_frame_for_qr(frame):
+    global previous_distance, last_qr_text, last_qr_ts
+    global latest_info, miss_streak, armed, blind_until_ms
+
+    now_ms = int(time.time() * 1000)
+    if now_ms < blind_until_ms:
+        return False  # ยังอยู่ช่วงตาบอดหลังปล่อยรถ
+
+    # --- decode ---
+    qrs = decode(frame)
+    if not qrs:
+        # ไม่เจอ → นับ miss เพื่อ re-arm
+        miss_streak += 1
+        if miss_streak >= QR_MISS_TO_REARM:
+            armed = True
+        return False
+
+    # เจออย่างน้อย 1 ตัว → รีเซ็ต miss
+    miss_streak = 0
+
+    # ใช้ตัวที่กรอบใหญ่สุด
+    best = max(qrs, key=lambda d: d.rect.width * d.rect.height)
+    qr_text = best.data.decode("utf-8")
+
+    # geometry สำหรับโชว์/ล็อก (ไม่เอาไปเป็นเงื่อนไขหยุด)
+    x, y, w, h = best.rect.left, best.rect.top, best.rect.width, best.rect.height
+    H, W = frame.shape[:2]
+    area = float(w * h) / float(W * H) if (W and H) else 0.0
+    cy   = (y + h / 2.0) / float(H) if H else 0.0
+
+    # อัปเดตข้อมูลโชว์ + ระยะ (คำนวณไว้แสดง แต่ไม่เอาไป gate)
+    data = mapping.get(qr_text)
+    distance_cm = _calc_distance(int(h), previous_distance)
+    previous_distance = distance_cm
+
+    latest_info.update({
+        "qr_text": qr_text,
+        "text": (data["name"] if data else qr_text),
+        "x": (data["x"] if data else None),
+        "y": (data["y"] if data else None),
+        "distance": distance_cm,
+        "height_px": int(h),
+    })
+
+    try: cv2.imwrite(latest_image_path, frame)
+    except: pass
+
+    # --- กติกาใหม่: "เจอปุ๊บ หยุดทันที" (ไม่เกี่ยวกับระยะ/ใกล้-ไกล) ---
+    now_s = now_ms / 1000.0
+    cooldown_ok = (qr_text != last_qr_text) or ((now_s - last_qr_ts) > QR_RETRIGGER_COOLDOWN_S)
+
+    if armed and cooldown_ok:
+        print(f"[PAUSE] Trigger id={qr_text} area={area:.3f} cy={cy:.2f} h={h}")
+        threading.Thread(
+            target=lambda: _motor_cmd(f"/pause_auto?id={qr_text}&ms=5000"),
+            daemon=True
+        ).start()
+        last_qr_text, last_qr_ts = qr_text, now_s
+        armed = False
+        blind_until_ms = now_ms + POST_PAUSE_BLIND_MS
+
+    return True
+
+# ================= Routes =================
+@app.route("/")
+def index():
+    return render_template_string(PAGE_TEMPLATE, qr_text=latest_info["text"])
+
+@app.route("/latest.jpg")
+def latest_jpg():
+    if os.path.exists(latest_image_path):
+        return send_file(latest_image_path, mimetype="image/jpeg")
+    return "no image", 404
+
+@app.route("/stream")
+def stream_route():
+    def gen():
+        while True:
+            f = cam.get_latest()
+            if f is None:
+                time.sleep(0.02)
+                continue
+            try:
+                process_frame_for_qr(f)
+            except Exception as e:
+                print("[QR] error:", e)
+            ok, buf = cv2.imencode(".jpg", f)
+            if not ok: 
+                continue
+            jpg = buf.tobytes()
+            yield (b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: " +
+                   str(len(jpg)).encode() + b"\r\n\r\n" + jpg + b"\r\n")
+            time.sleep(0.03)
+    return Response(gen(), mimetype="multipart/x-mixed-replace; boundary=frame")
+
+@app.route("/upload", methods=["POST"])
+def upload():
+    try:
+        img_np = np.frombuffer(request.get_data(), np.uint8)
+        f = cv2.imdecode(img_np, cv2.IMREAD_COLOR)
+        if f is None: return "bad image", 400
+        process_frame_for_qr(f)
+        return "OK"
+    except Exception as e:
+        print("upload error:", e)
+        return "error", 500
+
+@app.route("/text")
+def get_text():
+    return jsonify(latest_info)
+
+@app.route("/ping")
+def ping():
+    t0=time.perf_counter(); resp="pong"; dt=int((time.perf_counter()-t0)*1_000_000)
+    msg=f"RTT reply in {dt} us"; print("[PING]",msg); log_to_csv("PING",msg); return resp
+
+@app.route("/log_rtt", methods=["POST"])
+def log_rtt():
+    try:
+        data = request.data.decode("utf-8").strip()
+        print("[PONG]", data)
+        log_to_csv("PONG", data)
+        return "Logged"
+    except Exception as e:
+        print("log_rtt error:", e)
+        return "Error", 500
+
+# ---------- Telemetry ----------
+def _to_int(x):
+    try: return int(x)
+    except: return None
+
+@app.route("/log_telemetry", methods=["GET","POST"])
+def log_telemetry():
+    """GET: /log_telemetry?ms=...&ir=1,0,1,0,1&PvLPWM=...&PvRPWM=...&error=...&output=...&baseDyn=...
+       POST JSON: {"ms":...,"ir":[...],"PvLPWM":...,"PvRPWM":...,"error":...,"output":...,"baseDyn":...}
+    """
+    global telemetry_latest, telemetry_ring
+    if request.method=="POST" and request.is_json:
+        d=request.get_json(silent=True) or {}
+        ms=d.get("ms"); ir=d.get("ir")
+        PvLPWM=d.get("PvLPWM"); PvRPWM=d.get("PvRPWM")
+        err=d.get("error"); out=d.get("output"); base=d.get("baseDyn")
+    else:
+        q=request.args
+        ms=_to_int(q.get("ms"))
+        if q.get("ir"):
+            try: ir=[int(v) for v in q.get("ir").split(",")]
+            except: ir=None
+        else:
+            ir=[_to_int(q.get(k)) for k in ("ir1","ir2","ir3","ir4","ir5")]
+            if all(v is None for v in ir): ir=None
+        PvLPWM=_to_int(q.get("PvLPWM")); PvRPWM=_to_int(q.get("PvRPWM"))
+        err=_to_int(q.get("error")); out=_to_int(q.get("output")); base=_to_int(q.get("baseDyn"))
+
+    if isinstance(ir,list) and len(ir)>=5: telemetry_latest["ir"]=ir[:5]
+    telemetry_latest.update({"ms":ms,"PvLPWM":PvLPWM,"PvRPWM":PvRPWM,"error":err,"output":out,"baseDyn":base})
+
+    row=f"ms={ms},ir={telemetry_latest['ir']},PvLPWM={PvLPWM},PvRPWM={PvRPWM},error={err},output={out},baseDyn={base}"
+    telemetry_ring.append(row)
+    if len(telemetry_ring)>TELEM_MAX: telemetry_ring=telemetry_ring[-TELEM_MAX:]
+    log_to_csv("TELEM", row)
+    return "OK"
+
+@app.route("/telemetry")
+def get_telemetry():
+    return jsonify({"latest":telemetry_latest, "history":telemetry_ring[-20:]})
+
+# ---------- Explicit motor controls ----------
+@app.route("/forward")
+def _fwd():
+    return _motor_cmd("/forward")
+
+@app.route("/backward")
+def _back():
+    return _motor_cmd("/backward")
+
+@app.route("/left")
+def _left():
+    return _motor_cmd("/left")
+
+@app.route("/right")
+def _right():
+    return _motor_cmd("/right")
+
+@app.route("/stop")
+def _stop():
+    return _motor_cmd("/stop")
+
+@app.route("/set_speed")
+def set_speed():
+    v = request.args.get("value","0")
+    return _motor_cmd(f"/speed?value={v}")
+
+@app.route("/set_mode")
+def set_mode():
+    m = request.args.get("value","manual")
+    return _motor_cmd(f"/mode?value={m}")
+
+@app.route("/status")
+def status():
+    txt = _motor_get("/status")
+    if txt is None:
+        return Response('{"mode":"unknown","speed":0}', status=500, mimetype="application/json")
+    return Response(txt, status=200, mimetype="application/json")
+
+# ---------- Health / Config ----------
+@app.route("/health")
+def health():
+    up = time.time() - boot_ts
+    return jsonify({"uptime_s":round(up,1),
+                    "cam_stream_url":ESP32_CAM_STREAM_URL,
+                    "motor_ip":ESP32_MOTOR_IP,
+                    "focal_px":FOCAL_PX,
+                    "qr_real_h_cm":QR_REAL_HEIGHT_CM})
+
+@app.route("/set_config")
+def set_config():
+    global ESP32_CAM_STREAM_URL, ESP32_MOTOR_IP, FOCAL_PX
+    changed={}
+    cam_url=request.args.get("cam_url")
+    if cam_url: ESP32_CAM_STREAM_URL=cam_url; changed["cam_url"]=cam_url
+    motor=request.args.get("motor_ip")
+    if motor: ESP32_MOTOR_IP=motor; changed["motor_ip"]=motor
+    focal=request.args.get("focal_px")
+    if focal:
+        try: FOCAL_PX=int(focal); changed["focal_px"]=FOCAL_PX
+        except: pass
+    return jsonify({"ok":True,"changed":changed})
+
+@app.route("/reconnect_cam")
+def reconnect_cam():
+    cam.stop(); cam.__init__(ESP32_CAM_STREAM_URL); cam.start()
+    return jsonify({"ok":True, "cam_url":ESP32_CAM_STREAM_URL})
+
+# ================= Page (HTML) =================
+PAGE_TEMPLATE = r"""
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <title>ESP32 Dashboard</title>
+  <style>
+    body { font-family: sans-serif; display:flex; margin:0; height:100vh; }
+    .sidebar { width: 160px; background:#f44336; color:#fff; display:flex; flex-direction:column; align-items:stretch; padding-top:30px;}
+    .navbtn { display:block; width:100%; text-align:center; color:#fff; text-decoration:none; padding:12px 0; font-size:18px; cursor:pointer; }
+    .navbtn.active { font-weight:bold; text-decoration:underline; }
+    .main { flex:1; padding:20px; overflow-y:auto; }
+    .hidden { display:none; }
+    .circle-container { width:220px; height:220px; border:3px solid #333; border-radius:50%; position:relative; margin: 10px auto 20px auto; }
+    .circle-container button { position:absolute; width:50px; height:50px; background:#007bff; color:#fff; border:none; border-radius:10px; font-size:20px; }
+    .up { top:10px; left:50%; transform:translateX(-50%); }
+    .down { bottom:10px; left:50%; transform:translateX(-50%); }
+    .left { left:10px; top:50%; transform:translateY(-50%); }
+    .right { right:10px; top:50%; transform:translateY(-50%); }
+    .stop { top:50%; left:50%; transform:translate(-50%,-50%); background:#111; }
+    .panel { border:1px solid #ddd; padding:10px; border-radius:6px; }
+    iframe { border:2px solid #444; border-radius:5px; }
+    .kv { display:grid; grid-template-columns: 140px 1fr; gap:6px 10px; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Courier New", monospace; }
+  </style>
+</head>
+<body>
+  <!-- Sidebar -->
+  <div class="sidebar">
+    <a href="#" id="qrBtn"   class="navbtn active" onclick="switchPage('qr');return false;">QR read</a>
+    <a href="#" id="ctrlBtn" class="navbtn"        onclick="switchPage('control');return false;">Control</a>
+  </div>
+
+  <div class="main">
+    <!-- QR PAGE -->
+    <div id="qr-page">
+      <h2>Latest QR Code</h2>
+      <div class="panel">
+        <div id="qr-title">{{ qr_text }}</div>
+        <div>Distance: <span id="qr-distance">-</span></div>
+        <div>height_px: <span id="qr-h">-</span></div>
+        <div style="margin-top:8px;">
+          <iframe src="/stream" width="360" height="270"></iframe>
+        </div>
+        <div style="margin-top:6px;"><a href="/latest.jpg" target="_blank">Open last snapshot</a></div>
+      </div>
+
+      <h3>Campus Map</h3>
+      <div style="position:relative; width:100%; max-width:1000px;">
+        <img id="map-image" src="/static/Map_Project.png" style="width:100%; height:auto;">
+        <div id="marker" style="position:absolute; width:20px; height:20px; background:red; border-radius:50%;
+                                left:-9999px; top:-9999px; transform:translate(-50%,-50%); z-index:10;"></div>
+      </div>
+      <div id="pxlog" style="opacity:.6; margin-top:6px;"></div>
+    </div>
+
+    <!-- CONTROL PAGE -->
+    <div id="control-page" class="hidden">
+      <div class="circle-container">
+        <button class="up" onclick="cmd('forward')">↑</button>
+        <button class="down" onclick="cmd('backward')">↓</button>
+        <button class="left" onclick="cmd('left')">←</button>
+        <button class="right" onclick="cmd('right')">→</button>
+        <button class="stop" onclick="cmd('stop')">■</button>
+      </div>
+
+      <div class="panel" style="max-width:560px">
+        <div class="slider-container">
+          <label>Speed: <span id="spd">0</span> / 255</label>
+          <input id="spdRange" type="range" min="0" max="255" value="0" oninput="setSpeed(this.value)">
+        </div>
+
+        <div style="display:flex; gap:16px; margin-top:8px;">
+          <button onclick="setMode('auto')"   style="width:90px;height:60px;">
+            <div style="font-weight:bold;font-size:18px;">A</div><div>Auto</div>
+          </button>
+          <button onclick="setMode('manual')" style="width:90px;height:60px;">
+            <div style="font-weight:bold;font-size:18px;">M</div><div>Manual</div>
+          </button>
+          <button onclick="reconnectCam()">Reconnect Cam</button>
+        </div>
+
+        <div style="margin-top:10px;color:green" class="mono">
+          Mode: <span id="modeTxt">unknown</span> | Speed: <span id="speedTxt">0</span>
+        </div>
+      </div>
+
+      <h3>Live Telemetry</h3>
+      <div class="panel kv mono" style="max-width:560px">
+        <div>ms</div><div id="t-ms">-</div>
+        <div>IR (L2,L1,C,R1,R2)</div><div id="t-ir">-</div>
+        <div>PvLPWM</div><div id="t-pl">-</div>
+        <div>PvRPWM</div><div id="t-pr">-</div>
+        <div>error</div><div id="t-err">-</div>
+        <div>output</div><div id="t-out">-</div>
+        <div>baseDyn</div><div id="t-base">-</div>
+        <div>updated</div><div id="t-upd">-</div>
+      </div>
+
+      <h3>Recent 20 lines</h3>
+      <pre id="telemetry-log" class="panel mono" style="max-width:560px; max-height:260px; overflow:auto;">(waiting)</pre>
+    </div>
+  </div>
+
+<script>
+function switchPage(page){
+  document.getElementById("qr-page").classList.toggle("hidden", page!=="qr");
+  document.getElementById("control-page").classList.toggle("hidden", page!=="control");
+  document.getElementById("qrBtn").classList.toggle("active", page==="qr");
+  document.getElementById("ctrlBtn").classList.toggle("active", page==="control");
+}
+
+function cmd(action){ fetch("/"+action).catch(()=>{}); }
+function reconnectCam(){ fetch("/reconnect_cam").catch(()=>{}); }
+
+function setSpeed(v){
+  document.getElementById("spd").innerText = v;
+  document.getElementById("speedTxt").innerText = v;
+  fetch("/set_speed?value="+v).catch(()=>{});
+}
+function setMode(m){ fetch("/set_mode?value="+m).catch(()=>{}); }
+
+// Poll UI
+const poll = () => {
+  // QR info
+  fetch("/text").then(r=>r.json()).then(info=>{
+    const qt = document.getElementById("qr-title"); if(qt) qt.innerText = info.text || "No QR Code Detected";
+    const qd = document.getElementById("qr-distance"); if(qd) qd.innerText = (info.distance!=null)? (info.distance+" cm") : "-";
+    const qh = document.getElementById("qr-h"); if(qh) qh.innerText = (info.height_px!=null)? info.height_px : "-";
+
+    const marker=document.getElementById("marker");
+    const mapImg=document.getElementById("map-image");
+    const originalW=2000, originalH=1414;
+    if(marker && mapImg && info.x!=null && info.y!=null){
+      const sx = mapImg.clientWidth / originalW;
+      const sy = mapImg.clientHeight / originalH;
+      marker.style.left = (info.x*sx) + "px";
+      marker.style.top  = (info.y*sy) + "px";
+    }else if(marker){
+      marker.style.left="-9999px"; marker.style.top="-9999px";
+    }
+  }).catch(()=>{});
+
+  // Motor status
+  fetch("/status").then(r=>r.json()).then(s=>{
+    const spd = (s.manual_speed!=null ? s.manual_speed : (s.speed!=null ? s.speed : 0));
+    const mode = s.mode || "unknown";
+    document.getElementById("modeTxt").innerText = mode;
+    document.getElementById("speedTxt").innerText = spd;
+    const spdRange = document.getElementById("spdRange");
+    if (typeof spd === "number" && !isNaN(spd)) {
+      document.getElementById("spd").innerText = spd;
+      if (spdRange) spdRange.value = spd;
+    }
+  }).catch(()=>{});
+
+  // Telemetry
+  fetch("/telemetry").then(r=>r.json()).then(d=>{
+    const t=d.latest||{};
+    const ir=(t.ir&&t.ir.length>=5)?t.ir.slice(0,5).join(","):"-";
+    document.getElementById("t-ms").innerText   = (t.ms!=null)? t.ms : "-";
+    document.getElementById("t-ir").innerText   = ir;
+    document.getElementById("t-pl").innerText   = (t.PvLPWM!=null)? t.PvLPWM : "-";
+    document.getElementById("t-pr").innerText   = (t.PvRPWM!=null)? t.PvRPWM : "-";
+    document.getElementById("t-err").innerText  = (t.error!=null)? t.error : "-";
+    document.getElementById("t-out").innerText  = (t.output!=null)? t.output : "-";
+    document.getElementById("t-base").innerText = (t.baseDyn!=null)? t.baseDyn : "-";
+    document.getElementById("t-upd").innerText  = new Date().toLocaleTimeString();
+    document.getElementById("telemetry-log").innerText = (d.history||[]).join("\\n");
+  }).catch(()=>{});
+};
+setInterval(poll, 1000);
+
+// map click to get px
+const mapImg = document.getElementById("map-image");
+mapImg?.addEventListener("click",(e)=>{
+  const r=mapImg.getBoundingClientRect();
+  const x=e.clientX-r.left, y=e.clientY-r.top;
+  const msg=`pixel x=${Math.round(x)}, y=${Math.round(y)} (scale to 2000x1414 เองตามสัดส่วน)`;
+  const pxlog=document.getElementById("pxlog"); if(pxlog) pxlog.innerText=msg;
+  console.log(msg);
+});
+</script>
+</body>
+</html>
+"""
+
+# ================= Main =================
+if __name__ == "__main__":
+    print("[Flask] CAM:", ESP32_CAM_STREAM_URL)
+    print("[Flask] MOTOR:", ESP32_MOTOR_IP)
+    try:
+        app.run(host="0.0.0.0", port=5000, threaded=True)
+    finally:
+        try: cam.stop()
+        except: pass
