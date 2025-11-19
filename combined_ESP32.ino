@@ -84,14 +84,14 @@ unsigned long   pauseLastTs  = 0;
 
 // ================== motor_wi CORE (AUTO) ==================
 // PID config
-float Kp_mwi = 25, Ki_mwi = 0, Kd_mwi = 20;
-const float TURN_SCALE_MWI = 0.60f;
+float Kp_mwi = 35, Ki_mwi = 0, Kd_mwi = 35; // ค่า KP = 25 , KD = 20 เปลี่ยนเป็น 35 ทั้งคู่
+const float TURN_SCALE_MWI = 0.55f; // จากเดิม 0.60f เปลี่ยนเป็น 0.55f
 
 // speed shaping
-const int   STRAIGHT_MAX_MWI      = 90;
-const int   STRAIGHT_HARD_CAP_MWI = 85;   // กดเพดานตอนตรงชัดให้ต่ำกว่าฐานนิดนึง
-const int   CURVE_MIN_MWI         = 58;
-const int   GLOBAL_MAX_PWM_MWI    = 92;
+const int   STRAIGHT_MAX_MWI      = 85; // จากเดิม 90 เปลี่ยน 85
+const int   STRAIGHT_HARD_CAP_MWI = 83;   // กดเพดานตอนตรงชัดให้ต่ำกว่าฐานนิดนึง (เดิม 85 เปลี่ยนเป็น 83)
+const int   CURVE_MIN_MWI         = 65; // เดิม 58 เปลี่ยน 65
+const int   GLOBAL_MAX_PWM_MWI    = 100; // ค่าเดิม 92 เปลี่ยนเป็น 100
 const float BASE_SCALE_MWI  = 1.0f;
 const float SPEED_SCALE_MWI = 1.0f;
 
